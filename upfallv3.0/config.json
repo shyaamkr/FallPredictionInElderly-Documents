@@ -1,0 +1,79 @@
+{
+  "data_root": "C:/Data/FigShare/VideoDataset/VideoDataset",
+  "output_dir": "C:/Dev/mtech-study/upfallv3.0/output",
+  "extraction": {
+    "window_size": 50,
+    "overlap": 0.5
+  },
+  "activity_mapping": {
+    "l1": {
+      "fall": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+      "ambulatory": [13, 14, 15, 16, 17],
+      "transitional": [18, 19, 20, 21],
+      "stationary": [22, 23, 24, 25]
+    },
+    "l2": {
+      "fall": {
+        "forward_fall": [1, 2],
+        "backward_fall": [3, 4],
+        "lateral_fall": [5, 6],
+        "tripping": [7, 8],
+        "syncope": [9, 10],
+        "slip": [11, 12]
+      },
+      "ambulatory": {
+        "walking": [13],
+        "slow_walking": [14],
+        "jogging": [15],
+        "stairs_up": [16],
+        "stairs_down": [17]
+      },
+      "transitional": {
+        "sit_to_stand": [18],
+        "stand_to_sit": [19],
+        "bending": [20],
+        "picking_up": [21]
+      },
+      "stationary": {
+        "sitting": [22],
+        "lying_down": [23],
+        "standing_still": [24],
+        "leaning": [25]
+      }
+    }
+  },
+  "models": {
+    "xgboost": {
+      "n_estimators": 200,
+      "max_depth": 6,
+      "learning_rate": 0.1,
+      "subsample": 0.8,
+      "colsample_bytree": 0.8
+    },
+    "random_forest": {
+      "n_estimators": 200,
+      "max_depth": null,
+      "min_samples_split": 2,
+      "min_samples_leaf": 1
+    },
+    "lightgbm": {
+      "n_estimators": 200,
+      "max_depth": -1,
+      "learning_rate": 0.1,
+      "num_leaves": 31
+    },
+    "svm": {
+      "C": 1.0,
+      "kernel": "rbf",
+      "gamma": "scale"
+    }
+  },
+  "training": {
+    "n_splits": 5,
+    "random_state": 42
+  },
+  "prediction": {
+    "confidence_threshold": 0.6,
+    "ensemble_voting": "soft"
+  }
+}
