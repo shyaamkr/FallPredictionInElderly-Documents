@@ -29,13 +29,6 @@ config.json                         All paths, hyperparameters, activity mapping
 requirements.txt
 pose_landmark_full.task             MediaPipe pose model
 
-docs/
-  thesis_progress_report.md         Full thesis chapter (abstract -> methodology -> results)
-  viva_prep_notes.md                Feature/logic reference + probable examiner Q&A
-  RISK_SCORE_CHANGELOG.md           Dated log of every risk-score logic change and why
-  GCP_PORTING_INSTRUCTIONS.txt      Screenshot-based code porting workflow (restricted env)
-  COLAB_PORTING_INSTRUCTIONS.txt    Same, adapted for Google Colab
-
 tests/                              pytest suite
 output/                             Generated — features, models, plots, logs (git-ignored
                                     except small reference files; see .gitignore)
