@@ -1,8 +1,10 @@
 """Model training - 4-way internal L1, per-category L2, 4-tier modality dropout."""
 
+import warnings
 import numpy as np
 import pandas as pd
 import joblib
+from sklearn.exceptions import UndefinedMetricWarning
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import accuracy_score, f1_score
@@ -14,6 +16,27 @@ from .features import (
     WEARABLE_FEATURE_NAMES,
 )
 
+def _make_model(model_name: str, num_class=None):
+    """Create model with correct num_class. Works with old/new models.py."""
+    if num_class is not None:
+        num_class = int(num_class)
+        if num_class < 2:
+            raise ValueError(f"Cannot train with num_class={num_class}. Only 1 class in y!")
+    try:
+        # New models.py accepts num_class
+        return create_model(model_name, num_class=num_class)
+    except TypeError:
+        # Old models.py - fallback, then patch params
+        m = create_model(model_name)
+        if num_class is not None and hasattr(m, "set_params"):
+            try:
+                if num_class > 2:
+                    m.set_params(objective="multi:softprob", num_class=num_class)
+                elif num_class == 2:
+                    m.set_params(objective="binary:logistic")
+            except Exception:
+                pass
+        return m
 
 def _remap_l1(action_ids: np.ndarray) -> np.ndarray:
     """Map action_id to 3-way L1: ambulatory / fall / other."""
@@ -23,7 +46,6 @@ def _remap_l1(action_ids: np.ndarray) -> np.ndarray:
         for act_id in act_list:
             act_to_l1[act_id] = l1_cat
     return np.array([act_to_l1.get(int(a), "other") for a in action_ids])
-
 
 def _identify_modality_columns(feature_cols: list[str]) -> tuple[list[str], list[str]]:
     """Identify IMU and wearable columns within the feature set."""
@@ -46,6 +68,97 @@ def _identify_modality_columns(feature_cols: list[str]) -> tuple[list[str], list
 
     return imu_cols, wearable_cols
 
+def _has_all_classes(y_sub: np.ndarray, y_all: np.ndarray) -> bool:
+    """Return True if y_sub contains every class present in y_all."""
+    return set(np.unique(y_all)).issubset(set(np.unique(y_sub)))
+
+def _compute_adaptive_splits(
+    y: np.ndarray,
+    groups: np.ndarray,
+    max_splits: int = 5,
+) -> tuple[int, np.ndarray, int]:
+    """Compute safe CV split count from minimum class count and group count."""
+    class_counts = np.bincount(y)
+    positive_counts = class_counts[class_counts > 0]
+    min_class_count = int(np.min(positive_counts)) if len(positive_counts) > 0 else 0
+
+    n_unique_groups = len(np.unique(groups))
+    if n_unique_groups < 2:
+        groups_for_cv = np.arange(len(y))
+        effective_groups = len(groups_for_cv)
+    else:
+        groups_for_cv = groups
+        effective_groups = n_unique_groups
+
+    if min_class_count < 2 or effective_groups < 2:
+        return 0, groups_for_cv, min_class_count
+
+    n_splits = min(max_splits, effective_groups, min_class_count)
+    return max(2, n_splits), groups_for_cv, min_class_count
+
+def _run_cv_folds(
+    X_data: np.ndarray,
+    y_data: np.ndarray,
+    groups_data: np.ndarray,
+    model_name: str,
+    use_weight: bool,
+    max_splits: int = 5,
+    context_label: str = "L1",
+    num_class=None,
+) -> tuple[list[float], list[float]]:
+    """Run StratifiedGroupKFold with adaptive n_splits and clean single-sample handling."""
+    n_splits, groups_for_cv, min_class_count = _compute_adaptive_splits(
+        y_data, groups_data, max_splits=max_splits
+    )
+    if n_splits < 2:
+        logger.warning(
+            "Skipping CV for %s - least populated class has %d sample(s) "
+            "(groups=%d); fitting full subset directly",
+            context_label, min_class_count, len(np.unique(groups_for_cv)),
+        )
+        return [], []
+
+    if len(np.unique(groups_data)) < 2:
+        logger.warning(
+            "Only %d subject group(s) in %s - falling back to index groups with n_splits=%d",
+            len(np.unique(groups_data)), context_label, n_splits,
+        )
+
+    cv = StratifiedGroupKFold(n_splits=n_splits)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+        splits = list(cv.split(X_data, y_data, groups=groups_for_cv))
+
+    acc_scores, f1_scores = [], []
+    for fold_idx, (train_idx, val_idx) in enumerate(splits, start=1):
+        X_tr, X_val = X_data[train_idx], X_data[val_idx]
+        y_tr, y_val = y_data[train_idx], y_data[val_idx]
+
+        if not _has_all_classes(y_tr, y_data):
+            logger.warning(
+                "Skipping %s fold %d: missing class(es) in y_tr (%s vs %s)",
+                context_label, fold_idx, np.unique(y_tr), np.unique(y_data),
+            )
+            continue
+
+        model = _make_model(model_name, num_class=num_class)
+        fit_kwargs = {}
+        if use_weight:
+            fit_kwargs["sample_weight"] = _compute_sample_weight(y_tr)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+            model.fit(X_tr, y_tr, **fit_kwargs)
+            preds = model.predict(X_val)
+
+        acc_scores.append(accuracy_score(y_val, preds))
+        f1_scores.append(f1_score(y_val, preds, average="macro",
+                                  zero_division=0))
+
+    return acc_scores, f1_scores
 
 def train_model(model_name: str, level: str = "both") -> None:
     feat_path = FEATURES_DIR / "windowed_features_v5.parquet"
@@ -127,51 +240,43 @@ def train_model(model_name: str, level: str = "both") -> None:
         le_11 = LabelEncoder()
         y_11 = le_11.fit_transform(df["l1_category"].values)
         logger.info("L1 classes: %s", list(le_11.classes_))
+        n_classes_l1 = len(le_11.classes_)
+        if n_classes_l1 < 2:
+            raise ValueError(f"L1 has only {n_classes_l1} class: {list(le_11.classes_)} - check l1_category in parquet")
 
-        n_unique_groups = len(np.unique(groups))
-        n_splits = min(5, n_unique_groups)
-        if n_splits < 2:
-            logger.warning("Only %d subject group(s) - using simple split",
-                           n_unique_groups)
-            n_splits = 2
-            groups_for_cv = np.arange(len(X))
-        else:
-            groups_for_cv = groups
-        cv = StratifiedGroupKFold(n_splits=n_splits)
-
-        model = create_model(model_name)
-        acc_scores, f1_scores = [], []
-        for train_idx, val_idx in cv.split(X, y_11, groups=groups_for_cv):
-            X_tr, X_val = X[train_idx], X[val_idx]
-            y_tr, y_val = y_11[train_idx], y_11[val_idx]
-            fit_kwargs = {}
-            if use_weight:
-                fit_kwargs["sample_weight"] = _compute_sample_weight(y_tr)
-            model.fit(X_tr, y_tr, **fit_kwargs)
-            preds = model.predict(X_val)
-            acc_scores.append(accuracy_score(y_val, preds))
-            f1_scores.append(f1_score(y_val, preds, average="macro",
-                                      zero_division=0))
-
-        logger.info(
-            "L1 CV (%s): acc=%.3f+/-%.3f  f1_macro=%.3f+/-%.3f",
-            model_name, np.mean(acc_scores), np.std(acc_scores),
-            np.mean(f1_scores), np.std(f1_scores),
+        acc_scores, f1_scores = _run_cv_folds(
+            X, y_11, groups,
+            model_name=model_name,
+            use_weight=use_weight,
+            max_splits=5,
+            context_label="L1",
+            num_class=n_classes_l1,
         )
+        if acc_scores:
+            logger.info(
+                "L1 CV (%s, folds=%d): acc=%.3f+/-%.3f  f1_macro=%.3f+/-%.3f",
+                model_name, len(acc_scores), np.mean(acc_scores),
+                np.std(acc_scores), np.mean(f1_scores), np.std(f1_scores),
+            )
+        else:
+            logger.warning("No valid L1 CV folds completed")
 
-        final_model = create_model(model_name)
+        final_model = _make_model(model_name, num_class=n_classes_l1)
         fit_kwargs = {}
         if use_weight:
             fit_kwargs["sample_weight"] = _compute_sample_weight(y_11)
-        final_model.fit(X, y_11, **fit_kwargs)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            final_model.fit(X, y_11, **fit_kwargs)
         joblib.dump({"model": final_model, "label_encoder": le_11},
                     MODEL_DIR / f"{model_name}_11.joblib")
         logger.info("Saved %s_11.joblib", model_name)
 
-    # -- L2 training (ambulatory and fall only) --
+    # -- L2 training (per L1 category) --
     if level in ("l2", "both"):
         for l1_cat in ("ambulatory", "fall", "transitional", "stationary"):
-            mask = df["l1_category"] == l1_cat
+            mask = (df["l1_category"] == l1_cat).values
             sub_df = df[mask]
             if sub_df["l2_subtype"].nunique() < 2:
                 logger.warning("Skipping L2 for '%s' - only 1 subtype", l1_cat)
@@ -181,42 +286,36 @@ def train_model(model_name: str, level: str = "both") -> None:
             grp_sub = groups[mask]
             le_l2 = LabelEncoder()
             y_l2 = le_l2.fit_transform(sub_df["l2_subtype"].values)
+            n_classes_l2 = len(le_l2.classes_)
 
-            n_unique_grp = len(np.unique(grp_sub))
-            n_splits_l2 = min(5, n_unique_grp)
-            if n_splits_l2 < 2:
-                n_splits_l2 = 2
-                grp_sub_cv = np.arange(len(X_sub))
-            else:
-                grp_sub_cv = grp_sub
-            cv = StratifiedGroupKFold(n_splits=n_splits_l2)
-
-            acc_scores, f1_scores = [], []
-            model = create_model(model_name)
-            for train_idx, val_idx in cv.split(X_sub, y_l2,
-                                               groups=grp_sub_cv):
-                X_tr, X_val = X_sub[train_idx], X_sub[val_idx]
-                y_tr, y_val = y_l2[train_idx], y_l2[val_idx]
-                fit_kwargs = {}
-                if use_weight:
-                    fit_kwargs["sample_weight"] = _compute_sample_weight(y_tr)
-                model.fit(X_tr, y_tr, **fit_kwargs)
-                preds = model.predict(X_val)
-                acc_scores.append(accuracy_score(y_val, preds))
-                f1_scores.append(f1_score(y_val, preds, average="macro",
-                                          zero_division=0))
-
-            logger.info(
-                "L2[%s] CV (%s): acc=%.3f+/-%.3f  f1_macro=%.3f+/-%.3f",
-                l1_cat, model_name, np.mean(acc_scores), np.std(acc_scores),
-                np.mean(f1_scores), np.std(f1_scores),
+            acc_scores, f1_scores = _run_cv_folds(
+                X_sub, y_l2, grp_sub,
+                model_name=model_name,
+                use_weight=use_weight,
+                max_splits=5,
+                context_label=f"L2[{l1_cat}]",
+                num_class=n_classes_l2,
             )
+            if acc_scores:
+                logger.info(
+                    "L2[%s] CV (%s, folds=%d): acc=%.3f+/-%.3f  f1_macro=%.3f+/-%.3f",
+                    l1_cat, model_name, len(acc_scores), np.mean(acc_scores),
+                    np.std(acc_scores), np.mean(f1_scores), np.std(f1_scores),
+                )
+            else:
+                logger.warning(
+                    "No valid L2[%s] CV folds completed; saving model fitted on full '%s' subset",
+                    l1_cat, l1_cat,
+                )
 
-            final_model = create_model(model_name)
+            final_model = _make_model(model_name, num_class=n_classes_l2)
             fit_kwargs = {}
             if use_weight:
                 fit_kwargs["sample_weight"] = _compute_sample_weight(y_l2)
-            final_model.fit(X_sub, y_l2, **fit_kwargs)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning)
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                final_model.fit(X_sub, y_l2, **fit_kwargs)
             joblib.dump({"model": final_model, "label_encoder": le_l2},
                         MODEL_DIR / f"{model_name}_l2_{l1_cat}.joblib")
             logger.info("Saved %s_l2_%s.joblib", model_name, l1_cat)
